@@ -18,8 +18,33 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 const DEFAULT_REPORT = 'docs/CONFORMANCE.md';
+const DEFAULT_THRESHOLD = 50;
+
+/**
+ * Reads the two HTML-comment markers out of the report.
+ *
+ * Hex is accepted in any casing and the anchor is normalized to lowercase: a
+ * SHA pasted from a web UI or a terminal often arrives uppercase (#772), and
+ * the marker must not be reported as missing just because of its case. The
+ * threshold marker is untouched and keeps the historical default.
+ *
+ * Exported for test/check-conformance-staleness.test.js.
+ *
+ * @param {string} text
+ * @returns {{ anchorSha: string | null, threshold: number }}
+ */
+export function parseMarkers(text) {
+  const shaMatch = text.match(/<!--\s*conformance-facilitator-sha:\s*([0-9a-fA-F]+)\s*-->/);
+  const thresholdMatch = text.match(/<!--\s*conformance-staleness-threshold:\s*(\d+)\s*-->/);
+
+  return {
+    anchorSha: shaMatch ? shaMatch[1].toLowerCase() : null,
+    threshold: thresholdMatch ? Number(thresholdMatch[1]) : DEFAULT_THRESHOLD,
+  };
+}
 
 function parseArgs(argv) {
   let report = DEFAULT_REPORT;
@@ -64,17 +89,14 @@ function main() {
     fail(`Conformance report not found at ${report}. Create docs/CONFORMANCE.md.`);
   }
 
-  const shaMatch = text.match(/<!--\s*conformance-facilitator-sha:\s*([0-9a-f]+)\s*-->/);
-  const thresholdMatch = text.match(/<!--\s*conformance-staleness-threshold:\s*(\d+)\s*-->/);
+  const { anchorSha, threshold } = parseMarkers(text);
 
-  if (!shaMatch) {
+  if (!anchorSha) {
     fail(
       `${report} has no <!-- conformance-facilitator-sha: <sha> --> marker. ` +
         `Add one with the facilitator commit the report was last reconciled against.`,
     );
   }
-  const anchorSha = shaMatch[1];
-  const threshold = thresholdMatch ? Number(thresholdMatch[1]) : 50;
 
   console.log(`Report: ${report}`);
   console.log(`Anchor facilitator SHA: ${anchorSha}`);
@@ -124,4 +146,8 @@ function main() {
   );
 }
 
-main();
+// Only run when invoked directly, so the test suite can import parseMarkers
+// without running git against this checkout.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}
