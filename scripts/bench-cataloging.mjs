@@ -35,19 +35,26 @@
 
 /**
  * Minimal argv reader — flags only, no values needed beyond durations.
+ *
+ * A flag at the end of argv has no value to read, so the bounds check keeps
+ * `process.argv[idx + 1]` from being indexed past the end (#773). Missing or
+ * unusable values fall back to the default rather than to NaN.
+ *
+ * Exported for test/bench-cataloging-cli.test.js.
+ *
  * @param {string} name
  * @param {number} fallback
  * @returns {number}
  */
-function numFlag(name, fallback) {
+export function numFlag(name, fallback) {
   const idx = process.argv.indexOf(`--${name}`);
-  if (idx === -1) return fallback;
+  if (idx === -1 || idx + 1 >= process.argv.length) return fallback;
   const raw = Number(process.argv[idx + 1]);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
 }
 
-const DURATION_MS = numFlag('duration-ms', 5000);
-const WARMUP_MS = numFlag('warmup-ms', 1500);
+export const DURATION_MS = numFlag('duration-ms', 5000);
+export const WARMUP_MS = numFlag('warmup-ms', 1500);
 const AS_JSON = process.argv.includes('--json');
 
 /** Node's perf_hooks marks GC stop-the-world events with this detail entry. */
@@ -57,6 +64,7 @@ const MAJOR_GC_TYPES = new Set([2, 4, 7]); // kGCTypeMarkSweepCompact, increment
 
 import assert from 'node:assert/strict';
 import { performance, PerformanceObserver } from 'node:perf_hooks';
+import { pathToFileURL } from 'node:url';
 import { createApp } from '../src/app.js';
 import { stubRateLimiter } from '../test/helpers/rate-limiter.js';
 
@@ -201,53 +209,61 @@ async function runPhase(app, base, durationMs, sampleLatencies) {
 // Main
 // ---------------------------------------------------------------------------
 
-const gcObserver = observeGc();
-const app = await createApp(
-  testConfig(),
-  stubFacilitator(),
-  stubRateLimiter(),
-  stubCatalog(),
-  undefined,
-  { audit: silentAudit, logger: silentLogger },
-);
-await app.listen({ port: 0, host: '127.0.0.1' });
-const base = `http://127.0.0.1:${app.server.address().port}`;
+async function main() {
+  const gcObserver = observeGc();
+  const app = await createApp(
+    testConfig(),
+    stubFacilitator(),
+    stubRateLimiter(),
+    stubCatalog(),
+    undefined,
+    { audit: silentAudit, logger: silentLogger },
+  );
+  await app.listen({ port: 0, host: '127.0.0.1' });
+  const base = `http://127.0.0.1:${app.server.address().port}`;
 
-try {
-  // Warmup: JIT, sockets, and Fastify's route compilation settle down here.
-  await runPhase(app, base, WARMUP_MS, null);
+  try {
+    // Warmup: JIT, sockets, and Fastify's route compilation settle down here.
+    await runPhase(app, base, WARMUP_MS, null);
 
-  const latencies = [];
-  const rssBefore = process.memoryUsage().rss;
-  const ops = await runPhase(app, base, DURATION_MS, latencies);
-  const rssAfter = process.memoryUsage().rss;
+    const latencies = [];
+    const rssBefore = process.memoryUsage().rss;
+    const ops = await runPhase(app, base, DURATION_MS, latencies);
+    const rssAfter = process.memoryUsage().rss;
 
-  latencies.sort((a, b) => a - b);
-  const seconds = DURATION_MS / 1000;
-  const result = {
-    durationMs: DURATION_MS,
-    ops,
-    opsPerSecond: +(ops / seconds).toFixed(1),
-    p50Ms: +percentile(latencies, 50).toFixed(2),
-    p95Ms: +percentile(latencies, 95).toFixed(2),
-    p99Ms: +percentile(latencies, 99).toFixed(2),
-    rssDeltaMb: +((rssAfter - rssBefore) / 1024 / 1024).toFixed(2),
-    rssAfterMb: +(rssAfter / 1024 / 1024).toFixed(2),
-    gcMajorCount,
-  };
+    latencies.sort((a, b) => a - b);
+    const seconds = DURATION_MS / 1000;
+    const result = {
+      durationMs: DURATION_MS,
+      ops,
+      opsPerSecond: +(ops / seconds).toFixed(1),
+      p50Ms: +percentile(latencies, 50).toFixed(2),
+      p95Ms: +percentile(latencies, 95).toFixed(2),
+      p99Ms: +percentile(latencies, 99).toFixed(2),
+      rssDeltaMb: +((rssAfter - rssBefore) / 1024 / 1024).toFixed(2),
+      rssAfterMb: +(rssAfter / 1024 / 1024).toFixed(2),
+      gcMajorCount,
+    };
 
-  if (AS_JSON) {
-    console.log(JSON.stringify(result));
-  } else {
-    console.log('cataloging hot-path benchmark (POST /settle, catalogable body, sequential)');
-    console.log(`  duration        ${result.durationMs}ms`);
-    console.log(`  ops             ${result.ops}`);
-    console.log(`  ops/sec         ${result.opsPerSecond}`);
-    console.log(`  p50 / p95 / p99 ${result.p50Ms} / ${result.p95Ms} / ${result.p99Ms} ms`);
-    console.log(`  rss after       ${result.rssAfterMb}MB (delta ${result.rssDeltaMb}MB)`);
-    console.log(`  major GCs       ${result.gcMajorCount}`);
+    if (AS_JSON) {
+      console.log(JSON.stringify(result));
+    } else {
+      console.log('cataloging hot-path benchmark (POST /settle, catalogable body, sequential)');
+      console.log(`  duration        ${result.durationMs}ms`);
+      console.log(`  ops             ${result.ops}`);
+      console.log(`  ops/sec         ${result.opsPerSecond}`);
+      console.log(`  p50 / p95 / p99 ${result.p50Ms} / ${result.p95Ms} / ${result.p99Ms} ms`);
+      console.log(`  rss after       ${result.rssAfterMb}MB (delta ${result.rssDeltaMb}MB)`);
+      console.log(`  major GCs       ${result.gcMajorCount}`);
+    }
+  } finally {
+    await app.close();
+    gcObserver.disconnect();
   }
-} finally {
-  await app.close();
-  gcObserver.disconnect();
+}
+
+// Only run when invoked directly, so the test suite can import numFlag
+// without starting the benchmark.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
 }
