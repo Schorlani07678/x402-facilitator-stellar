@@ -27,7 +27,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import net from 'node:net';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Keypair } from '@stellar/stellar-sdk';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -183,8 +183,16 @@ async function assertHttpSeller() {
   await cleanup();
 }
 
-/** Minimal JSON-RPC client over a child's stdio. */
-function rpcClient(child) {
+/**
+ * Minimal JSON-RPC client over a child's stdio.
+ *
+ * Exported so test/smoke-examples-timer-cleanup.test.js can drive it without
+ * spawning the examples. Each pending request keeps its timeout handle, and the
+ * child's exit clears every one before rejecting: otherwise a crashed MCP
+ * server would leave a 15s active timer behind and keep this process alive
+ * long after the failure was already known (#771).
+ */
+export function rpcClient(child) {
   const rl = createInterface({ input: child.stdout });
   let nextId = 1;
   const pending = new Map();
@@ -204,8 +212,10 @@ function rpcClient(child) {
   });
 
   child.on('exit', code => {
-    for (const { reject } of pending.values())
+    for (const { timer, reject } of pending.values()) {
+      clearTimeout(timer);
       reject(new Error(`MCP server exited with code ${code}`));
+    }
     pending.clear();
   });
 
@@ -217,6 +227,7 @@ function rpcClient(child) {
         reject(new Error(`no response to ${method} within 15s`));
       }, 15_000);
       pending.set(id, {
+        timer,
         resolve: result => {
           clearTimeout(timer);
           resolve(result);
@@ -286,21 +297,29 @@ async function assertMcpAgent() {
   await cleanup();
 }
 
-let failed = false;
-try {
-  await assertHttpSeller();
-  console.log(
-    '✓ http-seller: paid route returns 402 with a well-formed PAYMENT-REQUIRED challenge',
-  );
-  await assertMcpAgent();
-  console.log(
-    '✓ mcp-agent: MCP server answers initialize and tools/list with a non-empty tool list',
-  );
-} catch (err) {
-  failed = true;
-  console.error(`✘ examples smoke test failed: ${err.message}`);
-} finally {
-  await cleanup();
+async function main() {
+  let failed = false;
+  try {
+    await assertHttpSeller();
+    console.log(
+      '✓ http-seller: paid route returns 402 with a well-formed PAYMENT-REQUIRED challenge',
+    );
+    await assertMcpAgent();
+    console.log(
+      '✓ mcp-agent: MCP server answers initialize and tools/list with a non-empty tool list',
+    );
+  } catch (err) {
+    failed = true;
+    console.error(`✘ examples smoke test failed: ${err.message}`);
+  } finally {
+    await cleanup();
+  }
+
+  process.exit(failed ? 1 : 0);
 }
 
-process.exit(failed ? 1 : 0);
+// Only run when invoked directly, so the test suite can import rpcClient
+// without spawning the examples.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}
